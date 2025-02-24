@@ -1,140 +1,123 @@
-"""Severity scoring with generic scoring framework"""
-from typing import Optional, Callable, Dict
+"""BMDL scoring implementation using new paradigm"""
 import numpy as np
 from canary import calculation_parameters as calc_p
 from canary import scored_model_parameters as smp
 from canary import time_series as ts
-from canary.numpy_supplement import date
-from canary.numpy_supplement import ndarray_extensions as ne
+from canary.estimator_and_scorer import main, scorer
+from canary.numpy_supplement import date, ndarray_extensions as ne
 
-class GenericScoringReport:
-    """Container for generic scoring results matching Canary's interface"""
-    def __init__(self, time_series, scores, normalized_scores, model_params):
-        self.input_time_series = time_series
-        self.scored_parameters = smp.ScoredModelParameters(
-            parameters=model_params,
-            bmdl_score=np.nan,  # Maintain interface compatibility
-            severity_score=normalized_scores
-        )
-        self.raw_scores = scores
-
-class GenericScorer:
-    """Core scoring class mirroring Canary's BMDL structure"""
-    def __init__(
-        self,
-        model_func: Callable,
-        loss_func: Callable, 
-        compare_func: Callable,
-        norm_func: Callable,
-        params: Dict
-    ):
-        self.model = model_func
-        self.loss = loss_func
-        self.compare = compare_func
-        self.normalize = norm_func
-        self.params = params
+class BMDLScoringMethod:
+    """Implements BMDL scoring using Canary's internal components"""
+    def __init__(self, params_canary=None):
+        self.params = params_canary or {}
+        self._setup_parameters()
         self.raw_scores = []
-        self.normalized_scores = []
-
-    def _prepare_time_series(self, observations, dates):
-        """Mirror Canary's time series preparation"""
-        period = self.params.get("period", 12)
-        return ts.TimeSeries(
-            observations=ne.Vector(observations),
-            timestamps=date.Sequence(sequence=dates, period=period)
+        
+    def _setup_parameters(self):
+        """Initialize parameters from Canary configuration"""
+        self.period = self._get_period(self.params.get("period", 12))
+        self.nu = self.params.get("nu", 5)
+        self.alpha = self.params.get("alpha", 1)
+        self.b_eta = self.params.get("b_eta", 60)
+        self.beta_supposed = self.params.get("beta_supposed", 
+                                           self.b_eta / scorer.beta_binomial_parameters.BETA_SUPPOSED_DIVISOR)
+        
+        self.lag1 = self._get_lag1()
+        self.meta = self._get_meta()
+        self.weights = self._get_weights()
+        
+    def model(self, segment):
+        """Construct time series model parameters for a segment"""
+        return tsmp.TimeSeriesModelParameters(
+            ne.IndicatorVector(np.zeros(len(segment), dtype=int)),  # No internal changepoints
+            self.params.get("sin_cos_pairs", 0),
+            amp.AutoregressiveModelParameters(order=self.params.get("ar_order", 1))
         )
 
-    def _compute_segment_score(self, G1, G2):
-        """Core scoring logic matching your framework"""
-        # With changepoint
-        model_G1 = self.model(G1)
-        model_G2 = self.model(G2)
-        loss_with = self.loss(model_G1, G1) + self.loss(model_G2, G2)
-
-        # Without changepoint
-        merged = np.concatenate([G1, G2])
-        model_merged = self.model(merged)
-        loss_without = self.loss(model_merged, merged)
-
-        return self.compare(loss_with, loss_without)
-
-    def calculate_scores(self, observations, dates, changepoints):
-        """Main scoring workflow matching Canary's calc_bmdl structure"""
-        time_series = self._prepare_time_series(observations, dates)
-        cps = np.where(changepoints == 1)[0]
-
-        # Compute scores for each changepoint
-        for cp in cps:
-            prev_cp = np.where(changepoints[:cp] == 1)[0][-1] if np.any(changepoints[:cp]) else 0
-            next_cp = np.where(changepoints[cp:] == 1)[0][0] + cp if np.any(changepoints[cp:]) else len(observations)
-            
-            G1 = observations[prev_cp:cp]
-            G2 = observations[cp:next_cp]
-            
-            score = self._compute_segment_score(G1, G2)
-            self.raw_scores.append((cp, score))
-
-        # Normalization
-        scores = np.full_like(observations, np.nan, dtype=float)
-        for cp, score in self.raw_scores:
-            scores[cp] = score
-            
-        self.normalized_scores = self.normalize(scores)
+    def loss(self, segment):
+        """Calculate BMDL loss for a segment"""
+        time_series = ts.TimeSeries(
+            observations=ne.Vector(segment),
+            timestamps=date.Sequence(np.arange(len(segment)), self.period)
+        )
         
-        return GenericScoringReport(
+        calculation_params = calc_p.CalculationParameters(
             time_series=time_series,
-            scores=scores,
-            normalized_scores=self.normalized_scores,
-            model_params=self.params
+            variance_multiplier=self.nu,
+            scorer_configuration=scorer.full.Configuration(
+                supposed_changepoints=self.meta,
+                a_lag_1_ac_scorer=self.lag1,
+                beta_binomial_parameters=scorer.beta_binomial_parameters.BetaBinomialParameters(
+                    alpha=self.alpha, beta=self.b_eta, beta_supposed=self.beta_supposed
+                )
+            ),
+            precision=1e-8,
+            weights=self.weights
         )
-
-def generic_calc_score(
-    observations: np.ndarray,
-    dates: np.ndarray,
-    changepoints: np.ndarray,
-    model_func: Callable,
-    loss_func: Callable,
-    compare_func: Callable,
-    norm_func: Callable,
-    params: Optional[dict] = None
-) -> GenericScoringReport:
-    """Entry point matching Canary's calc_bmdl signature"""
-    if params is None:
-        params = {}
         
-    scorer = GenericScorer(
-        model_func=model_func,
-        loss_func=loss_func,
-        compare_func=compare_func,
-        norm_func=norm_func,
-        params=params
-    )
-    
-    return scorer.calculate_scores(observations, dates, changepoints)
+        main_builder = main.EstimatorAndScorer(self.model(segment), calculation_params)
+        return main_builder.estimate_and_score().scored_parameters.bmdl_score
 
-# Example usage matching Canary's pattern:
-def triple_exp_model(segment):
-    # Implement your model fitting here
-    pass
+    def compare(self, loss_with, loss_without):
+        """Calculate BMDL improvement from changepoint"""
+        return loss_without - loss_with
 
-def mse_loss(model, segment):
-    # Implement MSE calculation
-    pass
+    def normalize(self, score):
+        """Apply Canary's standard normalization"""
+        clipped = np.clip(score, 1, None)
+        return np.minimum(np.round(np.log(clipped) * 10), 100)
 
-def score_compare(loss_with, loss_without):
-    return loss_without - loss_with
+    # Helper methods from original implementation
+    def _get_period(self, period_raw):
+        # Original _get_period implementation
+        if period_raw == 12: return date.Period.MONTHS_PER_YEAR
+        elif period_raw == 52: return date.Period.FLOOR_OF_WEEKS_PER_YEAR
+        elif period_raw == 53: return date.Period.CEILING_OF_WEEKS_PER_YEAR
+        elif period_raw == 7: return date.Period.DAYS_PER_WEEK
+        elif period_raw == 24: return date.Period.HOURS_PER_DAY
+        raise ValueError(f"Unsupported period: {period_raw}")
 
-def minmax_normalize(scores):
-    # Implement normalization
-    pass
+    def _get_lag1(self):
+        # Original _get_lag1 logic
+        lag1_type = self.params.get("r1_prior", "t-norm")
+        if lag1_type == "t-norm":
+            return scorer.lag_1_ac.TanTransformedNormal(
+                standard_deviation=self.params.get("std_r1", 0.35)
+            )
+        elif lag1_type == "beta":
+            return scorer.lag_1_ac.Beta(
+                beta_parameter=self.params.get("a_r1", 1)
+            )
+        raise ValueError(f"Unsupported lag1 type: {lag1_type}")
 
-report = generic_calc_score(
-    observations=data.observations,
-    dates=data.timestamps,
-    changepoints=results.best.eta,
-    model_func=triple_exp_model,
-    loss_func=mse_loss,
-    compare_func=score_compare,
-    norm_func=minmax_normalize,
-    params={"period": 12}
-)
+    def _get_meta(self):
+        # Original _get_meta logic
+        meta_raw = self.params.get("meta")
+        if meta_raw is None: 
+            return ne.IndicatorVector(np.zeros(0, dtype=int))
+        return ne.IndicatorVector.from_indices(len(meta_raw), meta_raw)
+
+    def _get_weights(self):
+        # Original _get_weights logic
+        weights_raw = self.params.get("weights")
+        return ws.Weights(np.ones_like(weights_raw)) if weights_raw is None else ws.Weights(weights_raw)
+
+    def compute_scores(self, full_series, changepoints):
+        """Main scoring workflow matching original calculate_severity"""
+        scores = np.full(len(full_series), np.nan)
+        
+        for cp in np.where(changepoints)[0]:
+            prev_cp = np.where(changepoints[:cp])[0][-1] if np.any(changepoints[:cp]) else 0
+            next_cp = np.where(changepoints[cp:])[0][0]+cp if np.any(changepoints[cp:]) else len(full_series)
+            
+            G1 = full_series[prev_cp:cp]
+            G2 = full_series[cp:next_cp]
+            merged = np.concatenate([G1, G2])
+            
+            loss_with = self.loss(G1) + self.loss(G2)
+            loss_without = self.loss(merged)
+            
+            scores[cp] = self.compare(loss_with, loss_without)
+            self.raw_scores.append(scores[cp])
+            
+        return self.normalize(scores)
